@@ -6,25 +6,29 @@ from openai.types.chat import ChatCompletion
 
 def make_request(
     client: openai.Client,
-    message: str,
+    user_message: str,
     model: str,
     max_tokens: int = 512,
     temperature: float = 1,
     n: int = 1,
+    assistant_prefix: str = None,
     **kwargs
 ) -> ChatCompletion:
     kwargs["top_p"] = 0.95
-    kwargs["max_completion_tokens"] = max_tokens
-    if model.startswith("o1-"):  # pop top-p and max_completion_tokens
+    kwargs["max_tokens"] = max_tokens
+    if model.startswith("o1-"):  # pop top-p and max_tokens
         kwargs.pop("top_p")
-        kwargs.pop("max_completion_tokens")
+        kwargs.pop("max_tokens")
         temperature = 1.0  # o1 models do not support temperature
+
+    messages = [{"role": "user", "content": user_message}]
+    if assistant_prefix:
+        messages.append({"role": "assistant", "content": assistant_prefix})
+        kwargs.setdefault("stop", ["\n```\n"])
 
     return client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "user", "content": message},
-        ],
+        messages=messages,
         temperature=temperature,
         n=n,
         **kwargs

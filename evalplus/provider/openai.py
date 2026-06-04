@@ -22,16 +22,18 @@ class OpenAIChatDecoder(DecoderBase):
     ) -> List[str]:
         if do_sample:
             assert self.temperature > 0, "Temperature must be positive for sampling"
-        batch_size = min(self.batch_size, num_samples)
-        prompt = self.instruction_prefix + f"\n```python\n{prompt.strip()}\n```"
+        user_message = (
+            self.instruction_prefix + f"\n```\n{prompt.strip()}\n```"
+        )
+        assistant_prefix = (
+            f"{self.response_prefix}\n```python\n"
+            if self.response_prefix
+            else "```python\n"
+        )
 
-        # use concurrency based batching for o1 and deepseek models
-        if self.name.startswith("o1-") or self.name == "deepseek-chat":
-            return self._codegen_batch_via_concurrency(prompt, num_samples)
+        return self._codegen_batch_via_concurrency(user_message, assistant_prefix, num_samples)
 
-        return self._codegen_api_batch(prompt, batch_size)
-
-    def _codegen_api_batch(self, prompt: str, batch_size: int) -> List[str]:
+    def _codegen_api_batch(self, user_message: str, assistant_prefix: str, batch_size: int) -> List[str]:
         client = openai.OpenAI(
             api_key=os.getenv("OPENAI_API_KEY", "none"),
             base_url=self.base_url,
@@ -40,7 +42,8 @@ class OpenAIChatDecoder(DecoderBase):
 
         ret = openai_request.make_auto_request(
             client,
-            message=prompt,
+            user_message=user_message,
+            assistant_prefix=assistant_prefix,
             model=self.name,
             max_tokens=self.max_new_tokens,
             temperature=self.temperature,
@@ -49,13 +52,17 @@ class OpenAIChatDecoder(DecoderBase):
 
         outputs = []
         for item in ret.choices:
-            outputs.append(item.message.content)
+            content = item.message.content or ""
+            # Strip the prefix if vLLM echoes it back in the response
+            if content.startswith(assistant_prefix):
+                content = content[len(assistant_prefix):]
+            outputs.append(content)
 
         return outputs
 
-    def _codegen_batch_via_concurrency(self, prompt: str, batch_size: int) -> List[str]:
+    def _codegen_batch_via_concurrency(self, user_message: str, assistant_prefix: str, num_samples: int) -> List[str]:
         batches = concurrent_call(
-            batch_size, self._codegen_api_batch, prompt, batch_size=1
+            num_samples, self._codegen_api_batch, user_message, assistant_prefix, batch_size=1
         )
         return [b[0] for b in batches]
 
