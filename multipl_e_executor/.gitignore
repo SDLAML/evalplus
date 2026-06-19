@@ -1,0 +1,6 @@
+# Build artifacts (rebuild with build_executor.sh)
+*.sif
+.apptainer-cache/
+.apptainer-tmp/
+logs/
+__pycache__/

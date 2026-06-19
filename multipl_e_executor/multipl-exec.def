@@ -1,0 +1,117 @@
+Bootstrap: docker
+From: python:3.12-slim
+
+# MultiPL-E multi-language code-execution service (aarch64 / GH200).
+#
+# This is an Apptainer translation of olmes-docker/src/multiple_execution/Dockerfile.
+# The original used the x86-only `public.ecr.aws/lambda/python:3.12` base; here we use
+# Debian `python:3.12-slim`, which has an official linux/arm64 manifest, and install the
+# language toolchains via apt + rustup (rustup auto-selects the aarch64 toolchain).
+#
+# Build on a node WITH internet (login node); run on compute nodes OFFLINE.
+#   apptainer build --fakeroot multipl-exec.sif multipl-exec.def
+#
+# The per-language evaluators (eval_*.py) hardcode some paths, which we reproduce here:
+#   - eval_java.py : CLASSPATH -> /opt/lib/javatuples-1.2.jar
+#   - eval_rust.py : /opt/bin/rustc  (no env passed to subprocess -> see %environment)
+
+%files
+    app.py                  /app/app.py
+    eval.py                 /app/eval.py
+    eval_python.py          /app/eval_python.py
+    eval_cpp.py             /app/eval_cpp.py
+    eval_java.py            /app/eval_java.py
+    eval_javascript.py      /app/eval_javascript.py
+    eval_php.py             /app/eval_php.py
+    eval_rust.py            /app/eval_rust.py
+    eval_sh.py              /app/eval_sh.py
+    eval_go.py              /app/eval_go.py
+    eval_ruby.py            /app/eval_ruby.py
+    eval_ts.py              /app/eval_ts.py
+    safe_subprocess         /app/safe_subprocess
+
+%environment
+    # Rust toolchain. eval_rust.py invokes /opt/bin/rustc WITHOUT passing env, so the
+    # rustup proxy must resolve its toolchain from these at container runtime.
+    export CARGO_HOME=/opt
+    export RUSTUP_HOME=/opt/lib/.rustup
+    export PATH=/opt/bin:$PATH
+    export PYTHONUNBUFFERED=1
+    # Go: the image fs is read-only, so point caches/module-mode at writable /tmp.
+    # eval_go.py runs `go test <file>_test.go`; GO111MODULE=off enables legacy file mode.
+    export GO111MODULE=off
+    export GOCACHE=/tmp/.go-cache
+    export GOPATH=/tmp/go
+    # Never let a host virtualenv (e.g. an activated llm_env on the launching shell) leak
+    # into the container's python. Always run with --cleanenv too, but this is the belt.
+    export PYTHONPATH=
+    export PYTHONNOUSERSITE=1
+
+%post
+    set -eux
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    # In a fakeroot/proot build sandbox, package post-install scripts that start services
+    # (notably systemd) fail. Stub policy-rc.d so apt never tries to (re)start services.
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+    chmod +x /usr/sbin/policy-rc.d
+
+    apt-get update
+    # Language runtimes/compilers for the supported MultiPL-E languages:
+    #   cpp -> g++ | java -> default-jdk-headless (javac/java) | js/ts -> nodejs (+ tsc)
+    #   php -> php-cli | sh -> bash | ruby -> ruby | go -> golang-go | (python is the base)
+    # Headless JDK avoids the GUI/systemd dependency chain that breaks fakeroot builds.
+    # node-typescript provides /usr/bin/tsc without pulling npm's dependency sprawl.
+    apt-get install -y --no-install-recommends \
+        g++ \
+        default-jdk-headless \
+        nodejs \
+        node-typescript \
+        php-cli \
+        bash \
+        ruby \
+        golang-go \
+        curl \
+        ca-certificates
+    rm -rf /var/lib/apt/lists/*
+
+    # JavaTuples jar required by the translated Java tests (eval_java.py CLASSPATH).
+    mkdir -p /opt/lib
+    curl -L https://repo.mavenlibs.com/maven/org/javatuples/javatuples/1.2/javatuples-1.2.jar \
+        -o /opt/lib/javatuples-1.2.jar
+
+    # Rust via rustup. CARGO_HOME=/opt makes the rustc proxy land at /opt/bin/rustc,
+    # matching the hardcoded path in eval_rust.py. rustup auto-detects aarch64.
+    export CARGO_HOME=/opt
+    export RUSTUP_HOME=/opt/lib/.rustup
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal
+    /opt/bin/rustc --version
+
+    # Execution-service deps (FastAPI app served by uvicorn in HTTP mode).
+    pip install --no-cache-dir fastapi "uvicorn[standard]" httpx "pydantic==2.*"
+
+%runscript
+    cd /app
+    exec uvicorn app:app --host 0.0.0.0 --port "${PORT:-8000}" --workers "${WORKERS:-4}"
+
+%test
+    # Sanity-check that every core-6 toolchain is present in the image.
+    set -e
+    g++ --version
+    javac -version
+    java -version
+    node --version
+    php --version
+    bash --version | head -n1
+    /opt/bin/rustc --version
+    ruby --version
+    tsc --version
+    go version
+    test -f /opt/lib/javatuples-1.2.jar && echo "javatuples OK"
+
+%labels
+    Purpose MultiPL-E core-6 code execution (cpp/java/js/php/rs/sh)
+    Source  vendored from olmes-docker/src/multiple_execution
+    Arch    linux/arm64 (GH200)

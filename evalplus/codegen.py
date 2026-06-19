@@ -1,6 +1,8 @@
 import gc
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
 from evalplus.data import get_evalperf_data, get_human_eval_plus, get_mbpp_plus
@@ -38,50 +40,61 @@ def codegen(
     print(f"Raw outputs will be saved to {raw_target_path}")
 
     backend_type: str = type(model).__name__
-    with progress(backend_type) as p:
-        for task_id, task in p.track(dataset.items()):
-            if id_range is not None:
-                id_num = int(task_id.split("/")[1])
-                low, high = id_range
-                if id_num < low or id_num >= high:
-                    p.console.print(f"Skipping {task_id} as it is not in {id_range}")
-                    continue
 
-            if not target_path.endswith(".jsonl"):
-                p_name = task_id.replace("/", "_")
-                os.makedirs(os.path.join(target_path, p_name), exist_ok=True)
-                task2nexist[task_id] = len(
-                    [
-                        f
-                        for f in os.listdir(os.path.join(target_path, p_name))
-                        if f.endswith(".py")
-                    ]
-                )
+    # Opt-in cross-task parallelism. Only enabled for the HTTP API backend, which is
+    # thread-safe (a fresh client per request, no shared mutable state). The in-process
+    # hf/vllm backends stay serial to avoid GPU contention/OOM. Output lines interleave
+    # but are task_id-keyed, so evaluate()'s pass@k is identical to the serial run.
+    workers = int(os.environ.get("EVALPLUS_CODEGEN_WORKERS", "1"))
+    parallel = (
+        workers > 1
+        and target_path.endswith(".jsonl")
+        and backend_type == "OpenAIChatDecoder"
+    )
+    write_lock = threading.Lock()
 
-            n_more_samples = n_samples
-            log = f"Codegen: {task_id} @ {model}"
-            if resume and task2nexist.get(task_id, 0) > 0:
-                log += f" (resuming from {task2nexist[task_id]})"
-                n_more_samples -= task2nexist[task_id]
+    def _gen_one(task_id, task, p):
+        if id_range is not None:
+            id_num = int(task_id.split("/")[1])
+            low, high = id_range
+            if id_num < low or id_num >= high:
+                p.console.print(f"Skipping {task_id} as it is not in {id_range}")
+                return
 
-            p.console.print(log)
+        if not target_path.endswith(".jsonl"):
+            p_name = task_id.replace("/", "_")
+            os.makedirs(os.path.join(target_path, p_name), exist_ok=True)
+            task2nexist[task_id] = len(
+                [
+                    f
+                    for f in os.listdir(os.path.join(target_path, p_name))
+                    if f.endswith(".py")
+                ]
+            )
 
-            sidx = n_samples - n_more_samples
-            while sidx < n_samples:
-                prompt = task["prompt"].strip() + "\n"
-                outputs = model.codegen(
-                    prompt,
-                    do_sample=not greedy,
-                    num_samples=n_samples - sidx,
-                )
-                assert outputs, "No outputs from model!"
-                for impl in outputs:
-                    solution = prompt + impl if model.is_direct_completion() else impl
-                    sanitized_solution = sanitize(
-                        solution, entrypoint=task["entry_point"]
-                    )
-                    if target_path.endswith(".jsonl"):
-                        # Writing the sanitized version
+        n_more_samples = n_samples
+        log = f"Codegen: {task_id} @ {model}"
+        if resume and task2nexist.get(task_id, 0) > 0:
+            log += f" (resuming from {task2nexist[task_id]})"
+            n_more_samples -= task2nexist[task_id]
+
+        p.console.print(log)
+
+        sidx = n_samples - n_more_samples
+        while sidx < n_samples:
+            prompt = task["prompt"].strip() + "\n"
+            outputs = model.codegen(
+                prompt,
+                do_sample=not greedy,
+                num_samples=n_samples - sidx,
+            )
+            assert outputs, "No outputs from model!"
+            for impl in outputs:
+                solution = prompt + impl if model.is_direct_completion() else impl
+                sanitized_solution = sanitize(solution, entrypoint=task["entry_point"])
+                if target_path.endswith(".jsonl"):
+                    # Lock so concurrent tasks never interleave partial lines.
+                    with write_lock:
                         with open(target_path, "a") as f:
                             f.write(
                                 json.dumps(
@@ -89,30 +102,42 @@ def codegen(
                                 )
                                 + "\n"
                             )
-
-                        # Writing the raw version
                         with open(raw_target_path, "a") as f:
                             f.write(
                                 json.dumps({"task_id": task_id, "solution": solution})
                                 + "\n"
                             )
-                    else:
-                        # Writing the sanitized version
-                        with open(
-                            os.path.join(target_path, p_name, f"{sidx}.py"),
-                            "w",
-                            encoding="utf-8",
-                        ) as f:
-                            f.write(sanitized_solution)
+                else:
+                    # Writing the sanitized version
+                    with open(
+                        os.path.join(target_path, p_name, f"{sidx}.py"),
+                        "w",
+                        encoding="utf-8",
+                    ) as f:
+                        f.write(sanitized_solution)
 
-                        # Writing the raw version
-                        with open(
-                            os.path.join(raw_target_path, p_name, f"{sidx}.py"),
-                            "w",
-                            encoding="utf-8",
-                        ) as f:
-                            f.write(solution)
-                    sidx += 1
+                    # Writing the raw version
+                    with open(
+                        os.path.join(raw_target_path, p_name, f"{sidx}.py"),
+                        "w",
+                        encoding="utf-8",
+                    ) as f:
+                        f.write(solution)
+                sidx += 1
+
+    with progress(backend_type) as p:
+        items = list(dataset.items())
+        if parallel:
+            p.console.print(
+                f"Parallel codegen across {len(items)} tasks with {workers} workers"
+            )
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_gen_one, tid, t, p) for tid, t in items]
+                for fut in p.track(as_completed(futures), total=len(futures)):
+                    fut.result()  # propagate any worker exception
+        else:
+            for task_id, task in p.track(items):
+                _gen_one(task_id, task, p)
 
 
 def run_codegen(
@@ -122,6 +147,7 @@ def run_codegen(
     bs: Optional[int] = None,
     n_samples: int = 1,
     temperature: float = 0.0,
+    limit: Optional[int] = None,
     num_ctx: Optional[int] = None,
     resume: bool = True,
     greedy: bool = False,
@@ -172,6 +198,9 @@ def run_codegen(
         assert id_range is None, "id_range not supported for evalperf"
     else:
         raise ValueError(f"Invalid dataset {dataset}")
+
+    if limit is not None and limit > 0:
+        dataset_dict = dict(list(dataset_dict.items())[:limit])
 
     all_tasks_complete = False
     if jsonl_fmt and os.path.isfile(target_path):
